@@ -6,7 +6,8 @@
 >
 > 这份是**总纲 + 在新机器上跑起来的步骤**。分层细节各有专文：
 > 消息采集看 [README.md](README.md)、手机遥控看 [DTCC.md](DTCC.md)、
-> 巡检流程看 [TRIAGE.md](TRIAGE.md)、hook 配置看 [settings.example.json](settings.example.json)。
+> 巡检流程看 [TRIAGE.md](TRIAGE.md)、hook 配置看 [settings.example.json](settings.example.json)、
+> 手机指令怎么在会话之间转派看 [ROUTER.md](ROUTER.md)。
 
 ---
 
