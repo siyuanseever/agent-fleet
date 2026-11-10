@@ -570,6 +570,43 @@ def match_named_session(session_ids, text: str) -> str:
     return ""
 
 
+def _bare_window(name: str) -> str:
+    """窗口名去掉 Claude Code 加在前面的动画字符（✳ ⠂ ⠐ ……），只留名字本身。"""
+    return re.sub(r"^[^\w]+", "", str(name or "")).strip()
+
+
+def main_of(cfg, sessions) -> tuple[str, str]:
+    """主会话现在是谁。返回 (sid, 状态)。**纯函数。**
+
+    优先认 `cc.main_window`（形如 `work:hub`，tmux 会话名:窗口名）：
+    那个窗口里现在活着的 Claude 就是主会话，窗口里换会话、/clear 都不受影响。
+    `cc.main_session`（写死的会话编号）只在没配窗口时用 —— 它在 2026-09 初悄悄失效过：
+    会话没了、编号还留在配置里，此后两个月手机指令全被随手塞给别的会话。
+
+    状态：`window` 按窗口认到 / `session` 老配置 / `gone` 配了窗口但里面现在没有活的 Claude /
+    `unset` 什么都没配。
+    """
+    cc = (cfg.get("cc") or {})
+    win = (cc.get("main_window") or "").strip()
+    if win:
+        want_sess, _, want_name = win.partition(":")
+        want_name = _bare_window(want_name)
+        hits = []
+        for sid, r in routable_sessions(sessions).items():
+            t = r.get("tmux") or ""
+            if t.split(":", 1)[0] != want_sess:
+                continue
+            if _bare_window(r.get("window_name")) != want_name:
+                continue
+            idx = t.rsplit(".", 1)[-1] if "." in t else ""
+            hits.append((int(idx) if idx.isdigit() else 999, sid))
+        if hits:
+            return min(hits)[1], "window"      # 同一窗口有队友时，取最左上那格（领队）
+        return "", "gone"
+    sid = cc.get("main_session") or ""
+    return (sid, "session") if sid else ("", "unset")
+
+
 def owner_of_quote(quoted_text: str, source=None) -> str:
     """他引用的那条播报是谁发的。认不出来返回空。"""
     return match_broadcast(_routes(source).broadcasts(), quoted_text)
@@ -587,15 +624,18 @@ def entitled(cfg, cmd: dict, sid: str, source=None) -> tuple[bool, str]:
         return True, "no-sid"          # 认不出自己，退回旧行为，不要把通道弄死
     source = _routes(source)
     target, why = target_of(cfg, cmd, source)
+    if why == "main-gone":
+        return False, "main-gone"      # 主会话窗口里现在没人：留着等它回来，不让别人捡
     if not target:
-        return True, "unrouted"        # 没人可派，谁来谁接，别把通道弄死
+        return True, "unrouted"        # 什么都没配：谁来谁接，别把通道弄死
     if target == sid:
         return True, f"mine({why})"
     if pane_of(target, source):
         return False, f"belongs-to-{sid_tag(target)}({why})"
-    # 主人的 pane 真的没了（status.json 里查不到）才放开，
-    # 否则这条指令会永远卡在一个不存在的会话名下。
-    return True, f"owner-pane-gone({sid_tag(target)})"
+    # 主人的 pane 没了：**不再放给别人捡**（2026-11-09 改）。
+    # 原来「谁先收尾谁拿走」，主会话失效的两个月里 26 条手机指令落进了 17 个不相干的会话。
+    # 留着不派，push-loop 那边会在手机上说一句「叫不醒」。宁可晚，不可派错。
+    return False, f"owner-gone({sid_tag(target)})"
 
 
 # ---------------------------------------------------------------- 遥控窗口
@@ -822,18 +862,21 @@ def target_of(cfg, cmd: dict, source=None) -> tuple[str, str]:
     正是错派的病根（实测有两条自检消息就是这么被派给了不相干的项目会话）。
     """
     source = _routes(source)
-    main = (cfg.get("cc") or {}).get("main_session") or ""
+    main, main_state = main_of(cfg, source.sessions())
     quoted = cmd.get("quoted_text") or ""
     if quoted:
         owner = owner_of_quote(quoted, source)
-        if owner:
+        if owner and pane_of(owner, source):
             return owner, "quote"
+        # 引用的那个会话已经没了：退回主会话，不留给「谁先收尾谁拿」
     named = named_session(cfg, cmd.get("text") or "", source)
     if named:
         return named, "named"
     if main:
         return main, "default→main"
-    logline("[push] config 里没配 cc.main_session，这条没人可派")
+    if main_state == "gone":
+        return "", "main-gone"
+    logline("[push] config 里没配 cc.main_window / cc.main_session，这条没人可派")
     return "", "unrouted"
 
 
@@ -931,7 +974,10 @@ def push_once(cfg, wake: bool = True) -> int:
 
         # note 只在「异常」时才发文字；正常情况一律只贴表情（见 react 的注释）
         note = ""
-        if not sid:
+        if why == "main-gone":
+            win = (cfg.get("cc") or {}).get("main_window") or "主会话"
+            note = f"主会话窗口 {win} 里现在没有 Claude，这条先留着，那边开起来就接。"
+        elif not sid:
             pass                      # 认不出归谁很常见，不值得发消息吵他，贴表情就够
         elif state == "busy":
             pass                      # 它收尾就会接，正常路径
@@ -1098,9 +1144,15 @@ def handle_meta(cfg, body: str) -> bool:
 def who_text(cfg) -> str:
     """现在的指令会落到谁手里。"""
     state = load_json(STATE, {})
-    main = (cfg.get("cc") or {}).get("main_session") or ""
+    try:
+        main, main_state = main_of(cfg, fleet_mod().sessions())
+    except Exception:                              # noqa: BLE001
+        main, main_state = "", "unset"
     bits = []
-    if main:
+    if main_state == "gone":
+        bits.append(f"⚠️ 主会话窗口 {(cfg.get('cc') or {}).get('main_window')} 里现在没有 Claude，"
+                    "默认指令先留着不派")
+    elif main:
         proj = ""
         try:
             proj = (fleet_mod().sessions().get(main) or {}).get("project") or ""
@@ -1109,7 +1161,7 @@ def who_text(cfg) -> str:
         where = f"（{proj}，pane {pane_of(main) or '?'}）" if proj else ""
         bits.append(f"默认收件人 → 主会话 {sid_tag(main)}{where}")
     else:
-        bits.append("⚠️ config 里没配 cc.main_session，默认收件人是空的")
+        bits.append("⚠️ config 里没配 cc.main_window，默认收件人是空的")
     bits.append("例外只有两种：①点某条播报的「回复」→ 归发那条的会话；"
                 "②话里点名（会话标签或项目名）→ 归它")
     recent, seen = [], set()
@@ -1471,7 +1523,7 @@ def cmd_hook_stop(cfg, args):
     # 只有**主会话**（和刚播报过的那个）挂着长轮询。其余会话收尾时只探一次就走 ——
     # 否则 15 个 pane 各等 600 秒、每 6 秒打一次接口，就是日志里那堆 PERMISSION_DENIED。
     # 挂长轮询的应该是默认收件人，跟着 target_of 的铁律走，不再用 speaker。
-    main_sid = (cfg.get("cc") or {}).get("main_session") or ""
+    main_sid, _ = main_of(cfg, _routes(None).sessions())
     mine = spoke or (sid and sid == main_sid)
     if alive and mine:
         timeout = int(cfg["cc"]["remote_wait_seconds"])

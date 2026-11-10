@@ -101,6 +101,7 @@
   "poll_interval": 6,
   "broadcast_max_chars": 700,
   "notify_always": false,
+  "main_window": "<总控那个 Claude 所在的 tmux 窗口，形如 work:hub；配了它就不看 main_session>",
   "main_session": "<总控那个 Claude 会话的 session id；手机上 /xxx 开头的命令固定发给它>"
  },
  "reminder": {

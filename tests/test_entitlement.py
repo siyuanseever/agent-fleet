@@ -144,19 +144,26 @@ class Entitled(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(why, "belongs-to-7ac5(default→main)")
 
-    def test_主人的pane没了才放开(self):
-        """主人的 pane 真的不在了（会话表里查不到）才让别人捡，
-        否则这条指令会永远卡在一个不存在的会话名下。"""
+    def test_主人的pane没了也不许别人捡(self):
+        """2026-11-09 改：原来主人不在就「谁先收尾谁拿」。配置里的主会话 9 月初就没了，
+        此后 26 条手机指令落进了 17 个不相干的会话。现在留着不派，由 push-loop 在手机上报一句。"""
         src = routes(panes={PROJ: "%2"})          # MAIN 不在会话表里
         ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
-        self.assertTrue(ok)
-        self.assertEqual(why, "owner-pane-gone(7ac5)")
+        self.assertFalse(ok)
+        self.assertEqual(why, "owner-gone(7ac5)")
 
     def test_pane字段是空串也算没了(self):
         src = routes(panes={MAIN: "", PROJ: "%2"})
         ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
-        self.assertTrue(ok)
-        self.assertEqual(why, "owner-pane-gone(7ac5)")
+        self.assertFalse(ok)
+        self.assertEqual(why, "owner-gone(7ac5)")
+
+    def test_引用的主人没了就退回主会话(self):
+        src = routes([bc(PROJ, "【CC 3f21】接口联调完了")],
+                     panes={MAIN: "%1", PROJ: "%134", OTHER: "%3"}, dead={PROJ})
+        cmd = {"text": "那就发吧", "quoted_text": "【CC 3f21】接口联调完了"}
+        self.assertEqual(dtcc.entitled(CFG, cmd, MAIN, src), (True, "mine(default→main)"))
+        self.assertFalse(dtcc.entitled(CFG, cmd, OTHER, src)[0])
 
     def test_没配主会话就谁来谁接(self):
         """没人可派的时候放行，别把通道弄死。
@@ -223,11 +230,11 @@ class 死会话不许当收件人(unittest.TestCase):
         self.assertEqual(dtcc.pane_of(MAIN, src), "")
         self.assertEqual(dtcc.pane_of(PROJ, src), "%2")
 
-    def test_主人死了那条后路才真的能走(self):
+    def test_主人死了也不许别人捡(self):
         src = routes(panes={MAIN: "%134", PROJ: "%2"}, dead={MAIN})
         ok, why = dtcc.entitled(CFG, {"text": "看一下进度"}, PROJ, src)
-        self.assertTrue(ok)
-        self.assertEqual(why, "owner-pane-gone(7ac5)")
+        self.assertFalse(ok)
+        self.assertEqual(why, "owner-gone(7ac5)")
 
     def test_死会话不进点名的候选池(self):
         src = routes(panes={MAIN: "%1", OTHER: "%134"}, dead={OTHER})
@@ -272,6 +279,58 @@ class NoSpeakerRule(unittest.TestCase):
         """FakeRoutes 只给播报环和会话表两样东西。多给一样，
         判据就有机会偷偷用上它。"""
         self.assertFalse(hasattr(dtcc.FakeRoutes(), "speaker"))
+
+
+
+class 主会话按窗口认(unittest.TestCase):
+    """2026-11-09：主会话改按 tmux 窗口认（`cc.main_window`），不再写死会话编号。
+    编号会随会话重开、/clear 变掉，变了也不报错 —— 9 月初就这么悄悄失效了两个月。"""
+
+    WCFG = {"cc": {"main_window": "work:hub", "main_session": OTHER}}
+
+    def src(self, *recs, dead=()):
+        sessions = {}
+        for sid, pane, tmux, name in recs:
+            sessions[sid] = {"pane": pane, "tmux": tmux, "window_name": name,
+                             "known": "gone" if sid in dead else "live"}
+        return dtcc.FakeRoutes(sessions=sessions)
+
+    def test_窗口里那个就是主会话(self):
+        s = self.src((MAIN, "%5", "work:2.1", "hub"), (PROJ, "%6", "work:3.1", "proj"))
+        self.assertEqual(dtcc.main_of(self.WCFG, s.sessions()), (MAIN, "window"))
+        self.assertEqual(dtcc.entitled(self.WCFG, {"text": "看一下"}, MAIN, s),
+                         (True, "mine(default→main)"))
+
+    def test_窗口名带动画字符也认得(self):
+        s = self.src((MAIN, "%5", "work:2.1", "✳ hub"))
+        self.assertEqual(dtcc.main_of(self.WCFG, s.sessions())[0], MAIN)
+
+    def test_别的tmux会话里同名窗口不算(self):
+        s = self.src((PROJ, "%6", "other:1.1", "hub"))
+        self.assertEqual(dtcc.main_of(self.WCFG, s.sessions()), ("", "gone"))
+
+    def test_有队友时取领队那格(self):
+        s = self.src((PROJ, "%7", "work:2.2", "hub"), (MAIN, "%5", "work:2.1", "hub"))
+        self.assertEqual(dtcc.main_of(self.WCFG, s.sessions())[0], MAIN)
+
+    def test_配了窗口就不看老的会话编号(self):
+        s = self.src((OTHER, "%9", "work:4.1", "x"))
+        self.assertEqual(dtcc.main_of(self.WCFG, s.sessions()), ("", "gone"))
+
+    def test_窗口里没人时谁都不许拿(self):
+        s = self.src((MAIN, "%5", "work:2.1", "hub"), (PROJ, "%6", "work:3.1", "proj"),
+                     dead={MAIN})
+        self.assertEqual(dtcc.entitled(self.WCFG, {"text": "看一下"}, PROJ, s),
+                         (False, "main-gone"))
+
+    def test_窗口里没人时点名照样能派(self):
+        s = self.src((PROJ, "%6", "work:3.1", "proj"))
+        self.assertEqual(dtcc.entitled(self.WCFG, {"text": "3f21 看一下"}, PROJ, s),
+                         (True, "mine(named)"))
+
+    def test_没配窗口就退回老的会话编号(self):
+        s = self.src((MAIN, "%5", "work:2.1", "hub"))
+        self.assertEqual(dtcc.main_of(CFG, s.sessions()), (MAIN, "session"))
 
 
 if __name__ == "__main__":

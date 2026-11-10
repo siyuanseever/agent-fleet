@@ -223,12 +223,14 @@ class WaitForCommandDropsEcho(unittest.TestCase):
         self.claimed, self.consumed = [], []
         self._orig = {k: getattr(dtcc, k) for k in
                       ("collect", "claim", "consume", "advance_cursor",
-                       "logline", "get_cursor")}
+                       "logline", "get_cursor", "_routes")}
         dtcc.claim = lambda mid, sid: (self.claimed.append((mid, sid)) or True)
         dtcc.consume = lambda ids: self.consumed.extend(ids)
         dtcc.advance_cursor = lambda newest, held: None
         dtcc.logline = lambda *a, **k: None
         dtcc.get_cursor = lambda cfg: ""
+        # 会话表用假的：不然 target_of 会去读生产的 data/fleet.json（审计钩子抓到过）
+        dtcc._routes = lambda source: source if source is not None else dtcc.FakeRoutes()
 
     def tearDown(self):
         for k, v in self._orig.items():
