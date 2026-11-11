@@ -974,14 +974,16 @@ def push_once(cfg, wake: bool = True) -> int:
 
         # note 只在「异常」时才发文字；正常情况一律只贴表情（见 react 的注释）
         note = ""
+        refused = ""                  # 没往窗格敲字的原因码（fleet.REFUSE_CN）；有就记一行 wake-refused
         if why == "main-gone":
             win = (cfg.get("cc") or {}).get("main_window") or "主会话"
             note = f"主会话窗口 {win} 里现在没有 Claude，这条先留着，那边开起来就接。"
         elif not sid:
             pass                      # 认不出归谁很常见，不值得发消息吵他，贴表情就够
         elif state == "busy":
-            pass                      # 它收尾就会接，正常路径
+            refused = "busy"          # 它收尾就会接，正常路径；不发文字，只记一行
         elif state == "blocked":
+            refused = "wait"
             # 停在权限框上：绝不敲字（会替人点头）。等他点完、这轮收尾就会接
             note = f"{sid_tag(sid)} 停在权限框上等你点头，这条等它跑完再接。"
         elif not wake:
@@ -994,7 +996,7 @@ def push_once(cfg, wake: bool = True) -> int:
                     logline(f"[push] lost-race :: {text[:60]}")
                 held.append(c["time"])
                 continue
-            ok = wake_session(cfg, sid, c)
+            ok, refused = wake_session(cfg, sid, c)
             if ok:
                 consume([mid])
                 done += 1
@@ -1012,14 +1014,20 @@ def push_once(cfg, wake: bool = True) -> int:
         if not push_seen(mid, f"{label}|{why}|{state}|{bool(note)}"):
             if note:                      # 只有异常才另发一句文字（回执早贴过了）
                 send(cfg, f"【CC·{who_tag()}】{note}")
+            if refused and sid:           # 同一条指令、同一个状态只记一次（跟着 push_seen 去重）
+                try:
+                    fl = fleet_mod()
+                    fl.append_event(fl.refusal_event("push", sid, rec, refused, "push-loop", now(), text[:60]))
+                except Exception as e:    # noqa: BLE001  记不下来不挡投递
+                    logline(f"[push] 记 wake-refused 失败 {type(e).__name__}: {e}")
             logline(f"[push] target={label or '-'}({why}) state={state or '-'} "
                     f":: {text[:60]}")
     advance_cursor(newest, held)
     return done
 
 
-def wake_session(cfg, sid: str, cmd: dict) -> bool:
-    """把指令打进目标会话的 pane。
+def wake_session(cfg, sid: str, cmd: dict) -> tuple[bool, str]:
+    """把指令打进目标会话的 pane。返回 `(成功, 没敲时的原因码)`，原因码同 fleet.REFUSE_CN。
 
     走 fleet.wake 那条路（tmux send-keys），因为 Claude Code 没有
     「往运行中的会话推一条消息」的接口。**不加 --force** —— 正在输出的会话
@@ -1036,22 +1044,22 @@ def wake_session(cfg, sid: str, cmd: dict) -> bool:
         # 用稳定的 %NN，不用 `session:window.index`（窗口一动就指错，见 pane_of）
         target = rec.get("pane") or rec.get("tmux", "")
         if not target or not fleet.pane_alive(target):
-            return False
+            return False, "pane-gone"
         if rec.get("state") in ("busy", "blocked"):     # blocked = 停在权限框，敲字会替人点头
-            return False
+            return False, fleet.refuse_reason(rec["state"])
         code, _ = fleet.sh(["tmux", "send-keys", "-t", target, "-l", task])
         if code != 0:
-            return False
+            return False, "send-failed"
         fleet.sh(["tmux", "send-keys", "-t", target, "Enter"])
         fleet.mark_wake(sid, cmd["text"])
         fleet.append_event({"who": "push-loop", "when": ts(now()),
                             "project": rec.get("project", ""),
                             "what": f"叫醒 {sid_tag(sid)}：{cmd['text'][:100]}",
                             "where": target})
-        return True
+        return True, ""
     except Exception as e:                        # noqa: BLE001
         logline(f"[push] wake 失败 {type(e).__name__}: {e}")
-        return False
+        return False, "error"
 
 
 def cmd_push_loop(cfg, args):

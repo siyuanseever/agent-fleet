@@ -105,6 +105,44 @@ def env_sid() -> str:
             or os.environ.get("CLAUDE_SESSION_ID") or "").strip()
 
 
+# ---------------------------------------------------------------- 被护栏拒绝也记一行
+#
+# 往别人窗格里敲字的路（wake / compact / autocompact 借道 compact / dtcc 的手机投递）被护栏拦下时，
+# 以前只打印在调用方的终端里，事后谁都看不到「今天拒了几次、为什么」。现在记进 events.ndjson，
+# kind=wake-refused。dry-run 不记（那是在问「会不会被拒」，不是真拒了）。
+
+REFUSE_CN = {"busy": "在跑", "wait": "停在权限框上", "pending-input": "输入框里有没提交的内容",
+             "awaiting-choice": "停在选择框上", "pane-gone": "pane 不在了"}
+
+
+def refuse_reason(guard_state: str) -> str:
+    """typing_guard 的状态词 → 拒绝原因码。**纯函数。**"""
+    return {"blocked": "wait", "busy": "busy"}.get(guard_state, guard_state or "?")
+
+
+def refusal_event(path: str, sid: str, rec: dict, reason: str, by: str, at, detail: str = "") -> dict:
+    """被护栏拒绝的那一行。**纯函数**：不读盘、不看时钟（`at` 传进来）。
+
+    path：哪条路（wake / compact / push）；by：谁调的（会话 sid 前 8 位、push-loop、autocompact、cli）。
+    """
+    pane = (rec or {}).get("pane", "")
+    return {"who": "fleet", "when": ts(at), "kind": "wake-refused", "path": path,
+            "sid": sid, "pane": pane, "where": pane, "project": (rec or {}).get("project", ""),
+            "reason": reason, "by": by or "cli",
+            "what": f"没敲字（{path}）→ {disp_of(rec or {})}：{REFUSE_CN.get(reason, reason)}"
+                    + (f"，{detail[:80]}" if detail else "")}
+
+
+def _log_refusal(args, path: str, sid: str, rec: dict, reason: str, detail: str = "") -> None:
+    if getattr(args, "dry_run", False):
+        return
+    by = getattr(args, "via", None) or (env_sid()[:8] or "cli")
+    try:
+        append_event(refusal_event(path, sid, rec, reason, by, now(), detail))
+    except OSError:
+        pass                               # 记不下来不挡住拒绝本身
+
+
 # 屏幕抓取那一层搬到了 tmux_probe.py —— 抽出去的理由和五种说谎方式见那个文件的
 # 模块文档，判据的测试在 tests/test_tmux_probe.py。这里只保留函数名，因为
 # console.py / dtcc.py / picker_items.py / board_html.py 都按这些名字在调。
@@ -1047,12 +1085,14 @@ def cmd_wake(args):
         return 1
     pane = rec.get("pane", "")               # %NN，稳定标识
     if not pane_alive(pane):
+        _log_refusal(args, "wake", sid, rec, "pane-gone")
         print(json.dumps({"ok": False, "target": disp_of(rec), "pane": pane,
                           "error": "pane 不在了，这个会话已经关掉"},
                          ensure_ascii=False))
         return 1
     ok, st, why = statetrail_src.typing_guard(rec, args.force)
     if not ok:
+        _log_refusal(args, "wake", sid, rec, refuse_reason(st))
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": st, "error": why},
                          ensure_ascii=False))
         return 1
@@ -1062,6 +1102,7 @@ def cmd_wake(args):
         # 可能替他确认了一件本该他自己点头的事——这是红线,不是体验问题,
         # 所以放在 pending_input 前面单独判、单独报,状态值也跟它区分开。
         if not args.force:
+            _log_refusal(args, "wake", sid, rec, "awaiting-choice")
             print(json.dumps({"ok": False, "target": disp_of(rec),
                               "state": "awaiting-choice",
                               "error": "对面停在一个交互选择框上（Enter to select / "
@@ -1082,6 +1123,7 @@ def cmd_wake(args):
         # 误判的代价是"这次没派进去"，比"静默冲掉压缩、会话继续涨"轻得多，
         # 所以宁可严一点，--force 留给确实要插队的时候。
         shown = "读不准（两次抓屏不一致）" if pending is None else pending[:60]
+        _log_refusal(args, "wake", sid, rec, "pending-input", shown)
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
                           "error": f"输入框里可能有未执行的内容（{shown}），"
                                    "现在打字会把它冲掉；确认要覆盖加 --force"},
@@ -1390,7 +1432,7 @@ def cmd_autocompact(args):
         # 复用已有那条路：三道护栏 + 等它真降下来 + 把被冲掉的任务原文重发。
         # **不在这里重写一份**，那会立刻变成第二份真相。
         rc = cmd_compact(argparse.Namespace(
-            target=sid, force=False, timeout=args.timeout))
+            target=sid, force=False, timeout=args.timeout, via="autocompact"))
         kb_after = _ctx_kb(ctx_usage(rec.get("pane", "")))
         note_compacted(sid, kb_before, kb_after, now())
         row = {"who": disp_of(rec), "pane": rec.get("pane", ""), "rc": rc,
@@ -1443,15 +1485,18 @@ def cmd_compact(args):
         return 1
     pane = rec.get("pane", "")
     if not pane_alive(pane):
+        _log_refusal(args, "compact", sid, rec, "pane-gone")
         print(json.dumps({"ok": False, "target": disp_of(rec), "pane": pane,
                           "error": "pane 不在了，这个会话已经关掉"}, ensure_ascii=False))
         return 1
     ok, st, why = statetrail_src.typing_guard(rec, args.force)
     if not ok:
+        _log_refusal(args, "compact", sid, rec, refuse_reason(st))
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": st, "error": why},
                          ensure_ascii=False))
         return 1
     if awaiting_choice(pane) and not args.force:
+        _log_refusal(args, "compact", sid, rec, "awaiting-choice")
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": "awaiting-choice",
                           "error": "对面停在一个交互选择框上，硬发 /compact 会被当成"
                                    "按键响应；确认要覆盖加 --force"}, ensure_ascii=False))
@@ -1461,6 +1506,7 @@ def cmd_compact(args):
     pending = pending_input_stable(pane)
     if pending != "" and not args.force:
         shown = "读不准（两次抓屏不一致）" if pending is None else pending[:60]
+        _log_refusal(args, "compact", sid, rec, "pending-input", shown)
         print(json.dumps({"ok": False, "target": disp_of(rec), "state": "pending-input",
                           "error": f"输入框里可能已经有未执行的内容（{shown}），"
                                    "现在发 /compact 会把它冲掉；确认要覆盖加 --force"},
