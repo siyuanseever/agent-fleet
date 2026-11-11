@@ -28,18 +28,19 @@ Claude 只在最末端出现——活被派到某个项目会话手里，那个 
 ## 1. 两个工具，单向依赖
 
 ```
-claude-tmux-sessions   通用、与消息来源无关     ← 「有哪些会话、什么状态、跳过去」的唯一真相
-        ↑ 读                                    prefix+g 打开 fzf picker
+statetrail             通用、与消息来源无关     ← 「有哪些会话、什么状态」的唯一真相
+        ↑ 读 statetrail-tmux list --json         tmux 底栏圆点、轨迹侧栏
 agent-fleet （本仓库）  钉钉适配那半          ← 加「消息怎么路由、队列、唤醒、事件」
 ```
 
-- **claude-tmux-sessions**（外部依赖，不在本仓库）：每个 Claude pane 的状态
-  靠 hook 写进 `~/.claude/tmux-claude-status.json`（pane / session / window / cwd /
-  status / session_id）。它是「会话存活/状态」的真相，本仓库**只读它**、不再自己维护一套。
-  没有它会怎样、缺哪些功能，见 [README.md](README.md) 的「外部依赖」一节。
-  > TODO：补上 claude-tmux-sessions 的仓库地址和安装说明。
+- **statetrail**（外部依赖，公开仓库，不在本仓库）：每个 Claude 窗格一条，
+  `pane / session / window / sid / cwd / state / state_since`。`state` 是
+  `run`（在跑）/ `wait`（停在权限框上）/ `done`（做完、人还没看）/ `read`（看过），
+  和 tmux 底栏的圆点同一份。本仓库**只读它**（`statetrail_src.py`），不自己维护一套。
+  2026-11-11 前读的是 claude-tmux-sessions 的 `~/.claude/tmux-claude-status.json`，
+  和路由会话看的 statetrail 是两份：11-09 同一个会话一边「在跑」、一边「静默 6 小时」。
 - **agent-fleet**（本仓库）：只加钉钉那半。**红线：具体消息内容、联系人、群名一律
-  不写进 claude-tmux-sessions**——那个是通用的，要保持跟任何一家公司无关。
+  不写进 statetrail**——那个是通用的，要保持跟任何一家公司无关。
 
 ---
 
@@ -101,7 +102,8 @@ agent-fleet （本仓库）  钉钉适配那半          ← 加「消息怎么�
 
 - **心跳**：每个会话 Stop hook 自动 `fleet.beat()`，记 project / 状态 / 坐标 / 最后一句。
 - **唤醒**：`fleet.py wake <项目名|pane> --task "..."` → `tmux send-keys` 把活打进那个 pane。
-  busy 会话默认拒（会打断输出），`--force` 插队。idle 会话靠这个才能被叫起来。
+  busy（statetrail `run`）默认拒（会打断输出），`--force` 插队；blocked（`wait`，停在权限框上）
+  **一律拒，`--force` 也不放**——敲进去的字会被当成对权限框的回答。idle 会话靠这个才能被叫起来。
 - **事件日志**：`data/events.ndjson`，一行一条（who/when/what/where），只追加。
   **会话间「记忆互通」的唯一真相**——各自按 project 过滤、各自压缩，不共写一份状态文件。
 - **监控屏**：`fleet.py board` 一屏看四样（路由/待接管/队列/心跳），挂 `watch` 常驻。

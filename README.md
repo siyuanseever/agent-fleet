@@ -178,37 +178,35 @@ python3 fleet.py beat --note "刚干完什么"    # 手工报一次心跳（平�
 不配的话会退回目录名 —— 那就会出现「这套东西叫 dtwatch，署名却写着 agent-fleet」
 这种膈应事。新开一个项目会话，在这张表里加一行就有名字了。
 
-**会话状态的真相是 `~/.claude/tmux-claude-status.json`**（见下面「外部依赖」一节）。
+**会话状态的真相是 statetrail**（`statetrail-tmux list --json`，见下面「外部依赖」一节）。
 fleet **不再自己维护一份心跳** —— 两套会话追踪器必然打架，谁对谁错说不清。
 
-`data/fleet.json` 退化成**薄 sidecar**，按 `session_id` 关联，只补那个文件没有的三样：
+`data/fleet.json` 退化成**薄 sidecar**，按 `session_id` 关联，只补 statetrail 没有的三样：
 `project`（项目短名）、`note`（最后干完的一句话）、`last_wake`。
 `dtcc.py hook-stop` 每次收尾调 `fleet.beat()` 写的就是这三样；失败只写日志，绝不挡住收尾。
 
-⚠️ **只读那个状态文件，绝不改 claude-tmux-sessions 仓库** —— 它是通用可分享的，
-IM/工作相关的东西不许进去。
+⚠️ **只读 statetrail，绝不改它的仓库** —— 它是通用可分享的，IM/工作相关的东西不许进去。
 
-### 外部依赖：`~/.claude/tmux-claude-status.json`
+### 外部依赖：statetrail
 
-**这个文件不由本仓库产生。** 它由一个独立的通用工具 **claude-tmux-sessions** 维护 ——
-那套东西给每个 tmux pane 里的 Claude Code 会话装一个 hook，会话状态一变就把
-`{pane, session, window, window_name, pane_index, cwd, status, updated_at, session_id}`
-写进这个 JSON。本仓库**只读它**。
+**会话状态不由本仓库产生。** 它来自独立的公开工具 **statetrail**（tmux 版命令 `statetrail-tmux`）。
+本仓库只跑 `statetrail-tmux list --json --turns 0`，读每个 Claude 窗格的
+`{pane, session, window, sid, cwd, state, state_since}`，读法在 `statetrail_src.py`。
+`state`：`run` 在跑 / `wait` 停在权限框上 / `done` 做完、人还没看 / `read` 看过。
+2026-11-11 前读的是 claude-tmux-sessions 写的 `~/.claude/tmux-claude-status.json`，已经不读了。
 
-> TODO：补上 claude-tmux-sessions 的仓库地址和安装说明。
-
-**没有这个文件会怎样**：`fleet.py` 的 `sessions()` 拿不到任何实时会话，于是
+**statetrail 读不到会怎样**（没装、超时）：`fleet.py` 的 `sessions()` 拿不到实时状态，于是
 
 | 命令 | 表现 |
 |---|---|
-| `fleet list` | 列不出会话，或只剩 sidecar 里记得的历史条目（标 `remembered`） |
+| `fleet list` | 只剩 sidecar 里记得、pane 还在的会话（标 `remembered`，状态 unknown） |
 | `fleet board` / `board_html.py` | 「谁在忙/闲」「卡住」这两块全空，路由表里的会话一律显示「查不到」 |
-| `fleet wake <项目>` | 解析不到目标 pane，直接失败 —— 叫不醒任何会话 |
+| `fleet wake <项目>` | 记得的会话还能按 pane 叫；记不得的解析不到，直接失败 |
 | `picker_items.py` | `[!] 卡住的会话` / `[Q] 待投递` 两类条目出不来 |
 
 消息采集、打标、队列、`pending`、`mark` **不受影响** —— 那半不依赖会话状态。
 `fleet.py` 还有一层兜底：读 `~/.claude/projects/*/` 下 transcript 的 mtime 判断
-「这个会话刚刚还在写盘」，所以状态文件缺失时仍能判断活没活，但**拿不到 pane**，
+「这个会话刚刚还在写盘」，所以仍能判断活没活，但**拿不到 pane**，
 因此依然叫不醒（猜 pane 会把活派错地方，宁可失败）。
 
 **任务台账 `data/tasks.ndjson`** 补的是「**闲着的会话不会自己去拉名下积压**」这个洞 ——
