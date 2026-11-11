@@ -41,7 +41,7 @@ except Exception:
 OUT_DIR = os.path.join(BASE, "data", "console")
 OUT = os.path.join(OUT_DIR, "index.html")
 EVENTS = os.path.join(BASE, "data", "events.ndjson")
-STATUS_JSON = os.path.expanduser("~/.claude/tmux-claude-status.json")
+import statetrail_src  # noqa: E402  会话状态只认 statetrail（2026-11-11）
 
 
 def esc(t) -> str:
@@ -74,11 +74,8 @@ def declared_roles() -> dict[str, str]:
 
 
 def claude_status() -> dict[str, dict]:
-    try:
-        with open(STATUS_JSON, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    """{pane: 记录}，来自 statetrail（statetrail_src.parse_list 的形状）。读不到是空。"""
+    return statetrail_src.panes()
 
 
 ROLE_STALE_HOURS = 24
@@ -197,10 +194,10 @@ def collect_panes(with_ctx: bool) -> list[dict]:
             "session": sname,
             "window": clean_w,
             "role": roles.get(f"{sname}:{clean_w}#{pidx}"),
-            "status": rec.get("status") or "?",
+            "status": rec.get("state") or "?",          # statetrail：run / wait / done / read
             "ctx": ctx,
             "cwd": pcwd.replace(os.path.expanduser("~"), "~"),
-            "seen": rec.get("updated_at"),
+            "seen": rec.get("since"),                   # 进入当前状态的时间
         })
     rows.sort(key=lambda r: (r["session"], r["window"], r["coord"]))
     return rows

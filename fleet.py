@@ -35,10 +35,11 @@ import uuid
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data")
-# 会话实况的**真相**：claude-tmux-sessions 那套通用工具维护的状态文件。
-# 20 个 pane 全在里面（pane/session/window/cwd/status/session_id/updated_at）。
-# fleet 不再自己维护一份 —— 两套会话追踪器必然打架，谁对谁错说不清。
-STATUS_FILE = os.path.expanduser("~/.claude/tmux-claude-status.json")
+# 会话实况的**真相**：statetrail（`statetrail-tmux list --json`），读法在 statetrail_src.py。
+# 2026-11-11 前读的是 claude-tmux-sessions 的 ~/.claude/tmux-claude-status.json，
+# 而 route.py 读 statetrail —— 两份各判各的，11-09 同一个会话一边「在跑」一边「静默 6 小时」。
+# fleet 不自己维护一份 —— 两套会话追踪器必然打架，谁对谁错说不清。
+import statetrail_src  # noqa: E402
 
 # fleet.json 退化成**薄 sidecar**：只补上面那个文件没有的三样东西。
 # 键是 session_id，值只有 {project, note, last_wake}。不再存 state/tmux/cwd/heartbeat。
@@ -174,7 +175,7 @@ def live_panes() -> set:
 # 「pane 已经不在了」这个判断的**唯一出处**在这一段，判死只认一个依据：
 # **`tmux list-panes -a` 里有没有这个 pane-id**（下面的第 2 层）。
 #
-# **绝不能拿「status.json 里查不到这个会话」当判死依据。** 2026-07-31 12:01
+# **绝不能拿「状态源（statetrail）里查不到这个会话」当判死依据。** 2026-07-31 12:01
 # 的事故就是反面教材：那套工具重建了状态文件，条目从 23 条掉到 2 条，
 # 于是所有路由目标一夜之间全被判成「已关闭」—— 那是误报。今天这份表有 107 个
 # 会话，真按第 1 层的缺失判，会一次性清空 100 个收件人。
@@ -203,10 +204,10 @@ def build_sessions(raw, side, panes, at, include_remembered=True, transcript_age
 
     **分三层，因为单看哪一层都会判错**（2026-07-31 12:01 踩过）：
 
-    1. `~/.claude/tmux-claude-status.json` —— Claude 的**状态**（running/input/done）
-       和 session_id ↔ pane 的映射。但它**不是全量快照**：那套工具会重建它，
-       重建后只剩「最近有活动的 pane」。12:01 它从 23 条掉到 2 条，
-       于是所有路由目标一夜之间全被判成「已关闭」—— 那是误报。
+    1. statetrail（`statetrail_src.parse_list` 的输出）—— Claude 的**状态**（run/wait/done/read）
+       和 session_id ↔ pane 的映射。它**也可能不全**：statetrail-tmux 没装、超时、出错时是空的。
+       2026-07-31 12:01 当时的状态文件从 23 条掉到 2 条，所有路由目标一夜之间全被判成
+       「已关闭」—— 那是误报。所以第 1 层缺失绝不判死。
     2. `tmux list-panes -a` —— pane **是否真的存在**。这才是存活的硬真相。
     3. sidecar 的 `last_seen` —— 我自己记的「上次见到这个 session 在哪个 pane」。
        状态文件缩水时靠它把会话认回来，再用第 2 层验证那个 pane 还在不在。
@@ -221,7 +222,7 @@ def build_sessions(raw, side, panes, at, include_remembered=True, transcript_age
     表现是走第 3 层被认回来，pane 还在就照样是活的。
 
     参数：
-      raw             status.json 的内容（键是 pane）
+      raw             statetrail_src.parse_list 的输出（键是 pane）
       side            sidecar `fleet.json` 的内容（键是 sid）
       panes           活 pane 集合 —— 第 2 层，硬真相
       at              「现在」，`age` 和 `last_seen.at` 都从它算 ——
@@ -237,10 +238,10 @@ def build_sessions(raw, side, panes, at, include_remembered=True, transcript_age
     seen_now = set()
     nowt = at.timestamp()
     for pane, r in (raw.items() if isinstance(raw, dict) else []):
-        sid = (r.get("session_id") or "").strip()
+        sid = (r.get("sid") or "").strip()
         if not sid:
             continue
-        st = r.get("status") or ""
+        st = r.get("state") or ""
         sc = side.get(sid) or {}
         cwd = r.get("cwd") or ""
         alive = pane in panes
@@ -250,12 +251,11 @@ def build_sessions(raw, side, panes, at, include_remembered=True, transcript_age
             "tmux": f"{r.get('session','')}:{r.get('window','')}.{r.get('pane_index','')}",
             "window_name": (r.get("window_name") or "").strip(),
             "cwd": cwd,
-            # input=在等输入（闲）、running=在跑（不能打断）、done=刚干完
-            "state": ({"input": "idle", "done": "idle", "running": "busy",
-                       "blocked": "blocked"}.get(st, st or "?")
-                      if alive else "closed"),
+            # run=在跑（不能打断）、wait=停在权限框（绝不能敲字）、done/read=闲着
+            "state": statetrail_src.fleet_state(st) if alive else "closed",
             "raw_status": st,
-            "age": int(nowt - (r.get("updated_at") or 0)),
+            # 进入当前状态多久了；statetrail 没给 state_since 就当很久
+            "age": int(nowt - r["since"]) if r.get("since") else 10 ** 6,
             # 优先级必须跟 beat() 一致：**config 映射 > sidecar 存的旧值**。
             # 反过来会出事：会话换了 cwd（比如从项目目录切回工作区根），
             # sidecar 里还留着旧的项目短名，于是 wake 那个项目时匹配到两个候选，
@@ -350,9 +350,9 @@ def _transcript_age(sid: str, nowt: float):
 def sessions(include_remembered: bool = True) -> dict:
     """session_id -> 会话实况。判据全在 `build_sessions()` 里，这里只剩 IO。
 
-    读三处：状态文件、sidecar、`tmux list-panes`；写一处：sidecar 的 `last_seen`。
+    读三处：statetrail、sidecar、`tmux list-panes`；写一处：sidecar 的 `last_seen`。
     """
-    raw = load_json(STATUS_FILE, {})
+    raw = statetrail_src.panes()
     side = load_json(FLEET, {})
     panes = live_panes()
     at = now()
@@ -601,7 +601,7 @@ def cmd_task(args):
             if live.get("ambiguous"):
                 rec["woke"] = "跳过（目标名匹配到多个会话，请用 sid 前缀）"
                 sid = ""
-            if sid and live.get("state") == "idle":
+            if sid and live.get("state") == "idle":      # blocked / busy 都不敲字，见 typing_guard
                 if tmux_send(live.get("pane", ""),
                              f"【台账任务 {tid}】{cur.get('text','')}"):
                     mark_wake(sid, cur.get("text", ""))
@@ -889,8 +889,8 @@ def beat(sid: str, state="idle", project="", cwd="", note="", where="") -> dict:
     """写一次 sidecar（顺带记事件日志）。dtcc 的 Stop hook 每轮收尾会调它。
 
     **注意这里不再记「状态/在哪个 pane/心跳时间」** —— 那些由
-    `~/.claude/tmux-claude-status.json` 负责，它比这边全（20 个 pane 都在）
-    也比这边准（tmux 那侧实时更新，不用等会话收尾）。
+    statetrail 负责（见 statetrail_src.py），它比这边全（每个 Claude 窗格都在）
+    也比这边准（实时更新，不用等会话收尾）。
     这里只留那个文件没有的三样：项目短名、最后干完的一句话、上次被唤醒的时间。
     `state` 参数保留是为了兼容老调用，实际不落盘。
     """
@@ -955,20 +955,19 @@ def cmd_list(args):
     """谁在忙、谁闲着、谁静默很久了。状态取自 tmux 那份真相。"""
     live = sessions()
     if not live:
-        print("（读不到 ~/.claude/tmux-claude-status.json，或里面没有带 session_id 的 pane）")
+        print("（statetrail-tmux list --json 读不到，或里面没有带 sid 的窗格）")
         return 0
     rows = sorted(live.values(), key=lambda r: r["age"])
     print(f"{'sid':10} {'项目':16} {'tmux':16} {'状态':12} 最后一句")
     for r in rows:
-        mark = {"idle": "○ 闲着", "busy": "● 在跑"}.get(r["state"], r["state"])
+        mark = {"idle": "○ 闲着", "busy": "● 在跑", "blocked": "⏸ 等点头"}.get(r["state"], r["state"])
         # "静默"该按"有没有在干活"算，不是按"最后一次输出行"的时间算——
         # 2026-08-01 5380 实测：297b11d9 跑一个 1h23m 的隔离库测试，全程不
-        # 产生新输出行，`age`（离 status.json 上次 updated_at 的秒数）
-        # 一路涨过 stale_after，被下面这行盖成了"静默 63m"，看着像停工，
-        # 差点被叫醒打断——它其实在 tmux-claude-status.json 里明明白白
-        # 标着 running（busy）。busy 是判"在不在干活"的权威信号，不该被
-        # "多久没吐一行字"这种弱信号覆盖，所以 busy 时这行直接跳过。
-        if r["state"] != "busy" and r["age"] > args.stale_after:
+        # 产生新输出行，`age` 一路涨过 stale_after，被下面这行盖成了"静默 63m"，
+        # 看着像停工，差点被叫醒打断——它其实在状态源里明明白白标着在跑（busy）。
+        # busy 是判"在不在干活"的权威信号，不该被"多久没吐一行字"这种弱信号覆盖，
+        # 所以 busy 时这行直接跳过。blocked（停在权限框）也跳过：那是在等人，不是静默。
+        if r["state"] not in ("busy", "blocked") and r["age"] > args.stale_after:
             mark = f"· 静默{fmt_age(r['age'])}"
         print(f"{r['sid'][:8]:10} {pad(r['project'], 16)} {pad(r['tmux'], 16)} "
               f"{pad(mark, 12)} {r['note'][:38]}")
@@ -1052,9 +1051,9 @@ def cmd_wake(args):
                           "error": "pane 不在了，这个会话已经关掉"},
                          ensure_ascii=False))
         return 1
-    if rec.get("state") == "busy" and not args.force:
-        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "busy",
-                          "error": "它正在跑，现在打字会打断它；真要插队加 --force"},
+    ok, st, why = statetrail_src.typing_guard(rec, args.force)
+    if not ok:
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": st, "error": why},
                          ensure_ascii=False))
         return 1
     choice_override = False
@@ -1211,6 +1210,8 @@ def should_compact(rec, kb, threshold_kb, at, last_at=None,
         return False, "pane 不在了"
     if rec.get("state") == "busy":
         return False, "正在跑，压会打断它"
+    if rec.get("state") == "blocked":
+        return False, "停在权限框上等人点头，敲 /compact 会被当成按键"
     age = rec.get("age")
     try:
         idle_s = int(age) if age not in (None, "") else None
@@ -1356,7 +1357,7 @@ def cmd_autocompact(args):
     sess = sessions()
     rows = []
     for sid, rec in sess.items():
-        if not routable(rec) or rec.get("state") == "busy":
+        if not routable(rec) or rec.get("state") in ("busy", "blocked"):
             continue
         rows.append((sid, rec, _ctx_kb(ctx_usage(rec.get("pane", "")))))
     hist = compact_history()
@@ -1445,9 +1446,9 @@ def cmd_compact(args):
         print(json.dumps({"ok": False, "target": disp_of(rec), "pane": pane,
                           "error": "pane 不在了，这个会话已经关掉"}, ensure_ascii=False))
         return 1
-    if rec.get("state") == "busy" and not args.force:
-        print(json.dumps({"ok": False, "target": disp_of(rec), "state": "busy",
-                          "error": "它正在跑，现在压会打断它；真要插队加 --force"},
+    ok, st, why = statetrail_src.typing_guard(rec, args.force)
+    if not ok:
+        print(json.dumps({"ok": False, "target": disp_of(rec), "state": st, "error": why},
                          ensure_ascii=False))
         return 1
     if awaiting_choice(pane) and not args.force:

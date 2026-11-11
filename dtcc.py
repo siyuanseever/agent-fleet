@@ -462,7 +462,7 @@ def speaker_sid(max_age: float = 0) -> str:
 # ---------------------------------------------------------------- 路由的 IO 接缝
 #
 # 「这条指令归谁」要问两处**生产状态**：播报环（`data/cc/state.json`）和会话表
-# （`fleet.sessions()`，真相在 `~/.claude/tmux-claude-status.json`）。判据直接
+# （`fleet.sessions()`，真相在 statetrail，见 statetrail_src.py）。判据直接
 # 长在这两处上面就等于不可测 —— 跟屏幕抓取那层是同一个病，`tmux_probe.py` 已经
 # 治过一次。照抄那边的两条：
 #
@@ -963,7 +963,7 @@ def push_once(cfg, wake: bool = True) -> int:
         sid, why = target_of(cfg, c)
         # 会话实况（在哪个 pane、闲没闲）**问 fleet，别自己读 fleet.json** ——
         # 那个文件 07-30 之后只是薄 sidecar（project/note/last_wake），
-        # 状态和 tmux 位置的真相在 ~/.claude/tmux-claude-status.json 里。
+        # 状态和 tmux 位置的真相在 statetrail 里（statetrail_src.py）。
         try:
             rec = fleet_mod().sessions().get(sid) or {}
         except Exception:                          # noqa: BLE001
@@ -981,6 +981,9 @@ def push_once(cfg, wake: bool = True) -> int:
             pass                      # 认不出归谁很常见，不值得发消息吵他，贴表情就够
         elif state == "busy":
             pass                      # 它收尾就会接，正常路径
+        elif state == "blocked":
+            # 停在权限框上：绝不敲字（会替人点头）。等他点完、这轮收尾就会接
+            note = f"{sid_tag(sid)} 停在权限框上等你点头，这条等它跑完再接。"
         elif not wake:
             pass
         else:
@@ -1034,7 +1037,7 @@ def wake_session(cfg, sid: str, cmd: dict) -> bool:
         target = rec.get("pane") or rec.get("tmux", "")
         if not target or not fleet.pane_alive(target):
             return False
-        if rec.get("state") == "busy":
+        if rec.get("state") in ("busy", "blocked"):     # blocked = 停在权限框，敲字会替人点头
             return False
         code, _ = fleet.sh(["tmux", "send-keys", "-t", target, "-l", task])
         if code != 0:

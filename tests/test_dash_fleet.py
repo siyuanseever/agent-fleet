@@ -16,7 +16,7 @@ if HERE not in sys.path:
 import dash                                             # noqa: E402
 
 
-def P(coord, ctx="10k (1%)", role=None, status="input"):
+def P(coord, ctx="10k (1%)", role=None, status="read"):
     sess = coord.split(":", 1)[0]
     return {"coord": coord, "session": sess, "pane": "%" + coord,
             "ctx": ctx, "role": role, "status": status}
@@ -24,7 +24,7 @@ def P(coord, ctx="10k (1%)", role=None, status="input"):
 
 class TestMemberMark(unittest.TestCase):
     def test_跑着的优先显示在跑(self):
-        self.assertEqual(dash.member_mark(P("a:w.1", status="running")), "▶")
+        self.assertEqual(dash.member_mark(P("a:w.1", status="run")), "▶")
 
     def test_零k是从没干过活(self):
         self.assertEqual(dash.member_mark(P("a:w.1", ctx="0k (0%)")), "○")
@@ -309,7 +309,7 @@ class TestHintNeverDisappears(unittest.TestCase):
 
     def test_正在跑的保留在跑记号_不被感叹号顶掉(self):
         """正在跑的会话你现在也压不了它，先知道它在跑更有用。"""
-        hot_run = P("a:w.1", ctx=f"{dash.COMPACT_KB + 100}k (54%)", status="running")
+        hot_run = P("a:w.1", ctx=f"{dash.COMPACT_KB + 100}k (54%)", status="run")
         line = dash.member_line(hot_run, 33, 0)
         self.assertTrue(line.startswith("▶"))
 

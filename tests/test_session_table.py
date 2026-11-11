@@ -25,21 +25,23 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fleet
+import statetrail_src
 
 
 AT = dt.datetime(2026, 8, 25, 12, 0, 0)
 
 
 def status(*panes):
-    """造 status.json 的内容。参数是 (pane, sid) 或 (pane, sid, 状态)。"""
-    out = {}
+    """造第 1 层：statetrail list --json 的条目，过一遍 statetrail_src.parse_list。
+    参数是 (pane, sid) 或 (pane, sid, statetrail 状态 run/wait/done/read)。"""
+    items = []
     for item in panes:
         pane, sid = item[0], item[1]
-        st = item[2] if len(item) > 2 else "input"
-        out[pane] = {"session_id": sid, "status": st, "session": "OS",
-                     "window": "3", "pane_index": "1", "window_name": "w",
-                     "cwd": "/tmp/x", "updated_at": AT.timestamp() - 30}
-    return out
+        st = item[2] if len(item) > 2 else "read"
+        items.append({"pane": pane, "sid": sid, "state": st, "session": "OS",
+                      "window": {"index": 3, "name": "w"}, "cwd": "/tmp/x",
+                      "state_since": (AT - dt.timedelta(seconds=30)).isoformat()})
+    return statetrail_src.parse_list(items, {p[0]: "1" for p in panes})
 
 
 def sidecar(*seen):
@@ -89,7 +91,7 @@ class 判死只认tmux(unittest.TestCase):
         self.assertFalse(fleet.routable(out["s1"]))
 
     def test_第一层有记录且pane还在_是live(self):
-        out, _ = build(status(("%7", "s1", "running")), {}, {"%7"})
+        out, _ = build(status(("%7", "s1", "run")), {}, {"%7"})
         self.assertEqual(out["s1"]["known"], "live")
         self.assertEqual(out["s1"]["state"], "busy")
         self.assertTrue(fleet.routable(out["s1"]))
@@ -127,7 +129,7 @@ class Routable(unittest.TestCase):
 
 class 分层顺序(unittest.TestCase):
     def test_第一层压过第三层(self):
-        raw = status(("%7", "s1", "running"))
+        raw = status(("%7", "s1", "run"))
         out, _ = build(raw, sidecar(("s1", "%99")), {"%7", "%99"})
         self.assertEqual(out["s1"]["known"], "live")
         self.assertEqual(out["s1"]["pane"], "%7")
@@ -192,13 +194,13 @@ class 坏输入(unittest.TestCase):
         self.assertEqual(list(out), ["s9"])
 
     def test_没有session_id的条目跳过(self):
-        raw = {"%7": {"status": "input"}, "%8": {"session_id": "  ", "status": "input"}}
+        raw = {"%7": {"state": "read"}, "%8": {"sid": "  ", "state": "read"}}
         out, _ = build(raw, {}, {"%7", "%8"})
         self.assertEqual(out, {})
 
     def test_年龄从注进来的时刻算(self):
         raw = status(("%7", "s1"))
-        raw["%7"]["updated_at"] = AT.timestamp() - 300
+        raw["%7"]["since"] = AT.timestamp() - 300
         out, _ = build(raw, {}, {"%7"})
         self.assertEqual(out["s1"]["age"], 300)
 

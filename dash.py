@@ -199,7 +199,7 @@ BOX_MIN = 34                 # 一个框最少要这么宽才装得下一行成�
                              # 边框2 + 记号1 + 空1 + 角色6 + 空1 + 坐标6 + 空1
                              #        + 条8 + 空1 + 数字5 ≈ 32，留 2 余量
 BOX_GAP = 2                  # 框与框之间的空隙
-MEMBER_MARK = {"running": "▶", "never": "○", "unknown": "?", "idle": "·"}
+MEMBER_MARK = {"run": "▶", "never": "○", "unknown": "?", "idle": "·"}
 
 
 def member_mark(p: dict) -> str:
@@ -209,8 +209,8 @@ def member_mark(p: dict) -> str:
     上下文读不出是「没有结论」，0k 是「有结论、结论是从没干过活」。
     把前者画成后者就是编造。
     """
-    if (p.get("status") or "") == "running":
-        return MEMBER_MARK["running"]
+    if (p.get("status") or "") == "run":
+        return MEMBER_MARK["run"]
     kb, _ = parse_ctx(p.get("ctx"))
     if kb is None:
         return MEMBER_MARK["unknown"]
@@ -239,13 +239,13 @@ def group_panes(panes: list, cap=GROUP_MAX, rows=GROUP_ROWS) -> tuple[list, int,
 
     def prank(p):
         return (0 if p.get("role") else 1,
-                0 if (p.get("status") or "") == "running" else 1,
+                0 if (p.get("status") or "") == "run" else 1,
                 -_kb(p), p.get("coord") or "")
 
     def grank(kv):
         name, ms = kv
         return (0 if any(m.get("role") for m in ms) else 1,
-                0 if any((m.get("status") or "") == "running" for m in ms) else 1,
+                0 if any((m.get("status") or "") == "run" for m in ms) else 1,
                 -sum(_kb(m) for m in ms), name)
 
     ordered = sorted(buckets.items(), key=grank)
@@ -261,7 +261,7 @@ def group_panes(panes: list, cap=GROUP_MAX, rows=GROUP_ROWS) -> tuple[list, int,
         # 读的人会以为剩下 5 个都是死的 —— 那是编造出来的结论。
         stat = {"total": len(ms),
                 "live": sum(1 for m in ms if _kb(m) > 0),
-                "run": sum(1 for m in ms if (m.get("status") or "") == "running"),
+                "run": sum(1 for m in ms if (m.get("status") or "") == "run"),
                 "hot": sum(1 for m in ms if needs_compact(m))}
         lost_m += max(0, len(ms) - keep)
         out.append((name, ms[:keep], stat))

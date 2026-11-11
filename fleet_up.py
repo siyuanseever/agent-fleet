@@ -45,12 +45,11 @@ except ImportError:
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOCAL_CFG = os.path.join(BASE, "_local-fleet.yaml")
 EXAMPLE_CFG = os.path.join(BASE, "fleet.example.yaml")
-STATUS_JSON = os.path.expanduser("~/.claude/tmux-claude-status.json")
 
 # capture 时用来判断「这个 pane 里坐着的是不是 Claude」。
 # pane_current_command 对 Claude 会话显示的是版本号（node 改了进程标题），
-# 形如 2.1.220 —— 但这只是**兜底**，主判据是 tmux-claude-status.json 里的 pane id，
-# 那份是 hook 亲手写的，比进程标题可靠。
+# 形如 2.1.220 —— 但这只是**兜底**，主判据是 statetrail 列出来的 pane id
+# （statetrail_src.py，2026-11-11 前是 tmux-claude-status.json），比进程标题可靠。
 CLAUDE_CMD_RE = re.compile(r"^\d+\.\d+\.\d+$")
 
 # up 时创建 pane 后等 shell 起来的时间。太短会把命令打进还没就绪的 shell。
@@ -149,13 +148,9 @@ def shrink(p: str) -> str:
 # ---------------------------------------------------------------- capture
 
 def claude_panes() -> dict[str, dict]:
-    """从 hook 写的状态文件里读「哪些 pane 是 Claude」。这是主判据。"""
-    import json
-    try:
-        with open(STATUS_JSON, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+    """从 statetrail 读「哪些 pane 是 Claude」（键是 pane id）。这是主判据。"""
+    import statetrail_src
+    return statetrail_src.panes()
 
 
 def cmd_capture(args) -> int:

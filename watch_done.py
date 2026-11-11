@@ -6,9 +6,10 @@
 提了个建议、问了个问题、或者摆出三个待办等人点头，却没写任何标记 ——
 那些字就烂在那个 pane 里，谁都不知道有人在等。
 
-这个部件不依赖会话自觉。它只看一件客观事实：tmux 状态文件里某个会话的
-status 从 running/input 变成了 done。一变，就把它最后那段 pane 输出抓下来，
-交给值班会话去判断「这里面有没有人在等」。
+这个部件不依赖会话自觉。它只看一件客观事实：statetrail 里某个会话的
+state 变成了 done（做完了、人还没看）。一变，就把它最后那段 pane 输出抓下来，
+交给值班会话去判断「这里面有没有人在等」。状态源 2026-11-11 起只认 statetrail
+（statetrail_src.py），和 fleet / route 同一份。
 
   用法：python3 watch_done.py            # 前台跑，每行输出是一个 done 事件
   停：  Ctrl-C 或 kill
@@ -16,11 +17,11 @@ status 从 running/input 变成了 done。一变，就把它最后那段 pane �
 输出契约：每个 done 事件先一行 `DONE| <sid> <会话/窗口> pane=%NN ...`，
 随后缩进若干行是 pane 尾部摘要，最后一行给出全文快照的路径。
 
-—— 一个补不了的洞，写在这儿别装作没有 ——
-状态文件不是全量快照，它只保留「最近有活动的 pane」，会被整体重建
-（实测有过一次从 23 条掉到 2 条）。所以一个会话如果在不在表里的时候进了
-done，这个脚本就看不见它，而且**无法从消费端补救** —— 要补得在生产端
-（写状态文件的那个 hook）保证 done 这个终态一定落一次。已知局限，不是 bug。
+—— 两个补不了的洞，写在这儿别装作没有 ——
+1. statetrail-tmux 读不到（没装、超时）的那几拍看不见任何会话；恢复后
+   还停在 done 的会照报，这期间 done → read 的就漏了。
+2. done 之后 15 秒内人就看了（变成 read），这次不报 —— 人已经看到了，
+   这个部件要补的是「没人知道有人在等」，这种不算漏。
 """
 import json
 import os
@@ -28,8 +29,7 @@ import subprocess
 import sys
 import time
 
-HOME = os.path.expanduser("~")
-STATUS = os.path.join(HOME, ".claude", "tmux-claude-status.json")
+import statetrail_src
 
 # data/ 整个不进版本库，所以状态和快照都放这儿：既不会被打包带走，
 # 也不会在仓库脱敏/重写历史时被卷进去。
@@ -55,10 +55,9 @@ KEEP_DAYS = 7          # 且只留最近多少天 —— 两个上限同时生�
 
 
 def load_status():
-    """状态文件随时可能正被重写，读失败就当这一拍没数据，下一拍再来。"""
+    """{pane: 记录}（statetrail_src.parse_list 的形状）。读失败是空，下一拍再来。"""
     try:
-        with open(STATUS) as f:
-            return json.load(f)
+        return statetrail_src.panes()
     except Exception:
         return {}
 
@@ -125,12 +124,11 @@ def capture(pane):
 
 
 def emit(info, text, capfile):
-    sid = (info.get("session_id") or "")[:8]
+    sid = (info.get("sid") or "")[:8]
     name = "%s/%s" % (info.get("session", "?"), info.get("window_name", "?"))
-    read = " [已读]" if info.get("read") else ""
     lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-    print("DONE| %s %s pane=%s%s cwd=%s" % (
-        sid, name, info.get("pane"), read, info.get("cwd", "")))
+    print("DONE| %s %s pane=%s cwd=%s" % (
+        sid, name, info.get("pane"), info.get("cwd", "")))
     for l in lines[-EXCERPT_LINES:]:
         print("    " + (l if len(l) <= LINE_CAP else l[:LINE_CAP] + "…"))
     print("    ---- 全文: %s" % capfile)
@@ -138,10 +136,11 @@ def emit(info, text, capfile):
 
 
 def done_records(data):
+    """**纯函数**：挑出 state=done（做完、人还没看）的会话。read（人看过）不报。"""
     for pane, info in data.items():
-        if info.get("status") != "done":
+        if info.get("state") != "done":
             continue
-        sid = info.get("session_id") or pane
+        sid = info.get("sid") or pane
         if sid[:8] in SKIP_SID_PREFIXES:
             continue
         yield sid, info
@@ -149,7 +148,7 @@ def done_records(data):
 
 def main():
     os.makedirs(CAPDIR, exist_ok=True)
-    seen = load_seen()          # sid -> 上次报过的那次 done 的 updated_at
+    seen = load_seen()          # sid -> 上次报过的那次 done 的 since（进入 done 的时间）
     first_run = not os.path.exists(SEEN_FILE)
 
     if first_run:
@@ -159,7 +158,7 @@ def main():
         data = load_status()
         stale = []
         for sid, info in done_records(data):
-            seen[sid] = info.get("updated_at")
+            seen[sid] = info.get("since")
             stale.append("%s(%s)" % (sid[:8], info.get("window_name", "?")))
         save_seen(seen)
         print("DONE| 首次装载，已把当下 %d 个 done 会话记为已知、不逐条抓取：%s"
@@ -170,7 +169,7 @@ def main():
         data = load_status()
         changed = False
         for sid, info in done_records(data):
-            stamp = info.get("updated_at")
+            stamp = info.get("since")
             if seen.get(sid) == stamp:
                 continue
             seen[sid] = stamp
