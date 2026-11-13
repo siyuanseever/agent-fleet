@@ -81,7 +81,8 @@ def load_json(path, default):
 
 def save_json(path, obj):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    # 每个进程用自己的临时文件：几个进程同时写同一份时，共用一个 .tmp 会互相把对方的改名掉（11-12 wake 因此崩过一次）
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
