@@ -274,3 +274,50 @@ class Reentrancy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _boundary(ts, post):
+    return ('{"type":"system","subtype":"compact_boundary","timestamp":"%s",'
+            '"compactMetadata":{"trigger":"manual","preTokens":499136,"postTokens":%d}}' % (ts, post))
+
+
+class StaleFooter(unittest.TestCase):
+    """11-09～11-12 实查：页脚数字只在有新一轮时刷新，压完闲着的会话会被白压一次又一次。"""
+
+    def test_压缩点之后没新一轮_算旧数(self):
+        st = fleet.parse_compact_state([
+            '{"type":"assistant","message":{}}', _boundary("2026-11-12T04:14:00Z", 31199),
+            '{"type":"user","isCompactSummary":true,"message":{}}'])
+        self.assertEqual(st["post_kb"], 31)
+        self.assertFalse(st["turn_after"])
+
+    def test_压缩点之后有新回复_页脚已刷新(self):
+        st = fleet.parse_compact_state([_boundary("2026-11-12T04:14:00Z", 31199),
+                                        '{"type": "assistant", "message": {}}'])
+        self.assertTrue(st["turn_after"])
+
+    def test_没压过返回None(self):
+        self.assertIsNone(fleet.parse_compact_state(['{"type":"assistant"}']))
+
+    def test_取最后一次压缩点(self):
+        st = fleet.parse_compact_state([_boundary("t1", 29000), '{"type":"assistant"}',
+                                        _boundary("t2", 33000)])
+        self.assertEqual((st["at"], st["post_kb"], st["turn_after"]), ("t2", 33, False))
+
+    def test_旧数不压(self):
+        yes, why = fleet.should_compact(rec(), 499, 300, AT,
+                                        post_compact={"post_kb": 31, "turn_after": False})
+        self.assertFalse(yes)
+        self.assertIn("旧数", why)
+
+    def test_压完后又聊过_照常按数字判(self):
+        yes, _ = fleet.should_compact(rec(), 420, 300, AT,
+                                      post_compact={"post_kb": 31, "turn_after": True})
+        self.assertTrue(yes)
+
+    def test_挑人时也认旧数(self):
+        rows = [("a", dict(rec(), sid="a", pane="%1"), 499), ("b", dict(rec(), sid="b", pane="%2"), 400)]
+        take, skip = fleet.pick_compact_targets(rows, 300, AT,
+                                                post_by_sid={"a": {"post_kb": 31, "turn_after": False}})
+        self.assertEqual([t[0] for t in take], ["b"])
+        self.assertIn("旧数", dict(skip)["a"])

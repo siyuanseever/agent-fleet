@@ -1225,9 +1225,45 @@ AUTOCOMPACT_LOCK = os.path.join(DATA, "autocompact.lock")
 COMPACT_LOG = os.path.join(DATA, "compact_log.ndjson")   # 只追加：谁什么时候被压过
 
 
+def parse_compact_state(lines):
+    """transcript 末尾这些行里，最近一次压缩是什么情况。**纯函数。**
+
+    返回 None（这段里没压过），或 `{"at", "post_kb", "turn_after"}`：
+    `turn_after` = 压缩点之后有没有新的 assistant 回复。没有的话，页脚数字还是压之前的。
+    以 transcript 的压缩点为准，不以页脚为准：页脚是屏幕上的旧画面，压缩点是会话自己记的。
+    """
+    last, after = None, False
+    for ln in lines or ():
+        if '"compact_boundary"' in ln:
+            try:
+                r = json.loads(ln)
+            except ValueError:
+                continue
+            if r.get("subtype") != "compact_boundary":
+                continue
+            meta = r.get("compactMetadata") or {}
+            post = meta.get("postTokens")
+            last = {"at": r.get("timestamp", ""),
+                    "post_kb": round(post / 1000) if isinstance(post, (int, float)) else None}
+            after = False
+        elif last is not None and '"type":"assistant"' in ln.replace(" ", ""):
+            after = True
+    if last is None:
+        return None
+    last["turn_after"] = after
+    return last
+
+
+def compact_state_of(sid):
+    """IO 外壳：读这个会话 transcript 的末尾，交给 parse_compact_state。"""
+    path = transcript_of(sid)
+    return parse_compact_state(tail_text(path, 2048)) if path else None
+
+
 def should_compact(rec, kb, threshold_kb, at, last_at=None,
                    cooldown_minutes=AUTOCOMPACT_COOLDOWN_MINUTES,
-                   min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS):
+                   min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS,
+                   post_compact=None):
     """这个会话现在该不该压。**纯函数。** 返回 `(该压吗, 理由)`。
 
     理由字符串两边都要给 —— 「为什么没压」跟「为什么压了」一样需要能解释，
@@ -1268,6 +1304,12 @@ def should_compact(rec, kb, threshold_kb, at, last_at=None,
         return False, "%d 秒前还在动（要求安静满 %d 秒）" % (idle_s, min_idle_seconds)
     if kb < threshold_kb:
         return False, "%dk < 阈值 %dk" % (kb, threshold_kb)
+    if post_compact and not post_compact.get("turn_after"):
+        # 页脚数字只在会话有新的一轮时才刷新。压完以后会话一直闲着，页脚就一直挂着压之前的数，
+        # 下一轮巡检读到它还会再压一次（11-09～11-12 实查：真压掉的之后一小时左右必有一次
+        # 31k→32k 的白压；有个会话被内置自动压缩压到 36k 后，这里照旧数字 304k 连压了 8 次）。
+        return False, "记录里最近一次压缩已生效（压到 %sk），之后没有新的一轮，页脚 %dk 是旧数" % (
+            post_compact.get("post_kb", "?"), kb)
     if last_at:
         try:
             mins = (at - parse_ts(last_at)).total_seconds() / 60.0
@@ -1281,7 +1323,8 @@ def should_compact(rec, kb, threshold_kb, at, last_at=None,
 def pick_compact_targets(rows, threshold_kb, at, last_by_sid=None,
                          cooldown_minutes=AUTOCOMPACT_COOLDOWN_MINUTES,
                          cap=AUTOCOMPACT_MAX_PER_RUN,
-                         min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS):
+                         min_idle_seconds=AUTOCOMPACT_MIN_IDLE_SECONDS,
+                         post_by_sid=None):
     """挑这一轮要压的。**纯函数。**
 
     `rows` 是 `[(sid, rec, kb)]`，`kb` 由调用方抓屏得到（IO 在外面）。
@@ -1296,7 +1339,7 @@ def pick_compact_targets(rows, threshold_kb, at, last_by_sid=None,
     for sid, rec, kb in rows or ():
         ok, why = should_compact(rec, kb, threshold_kb, at,
                                  (last_by_sid or {}).get(sid), cooldown_minutes,
-                                 min_idle_seconds)
+                                 min_idle_seconds, (post_by_sid or {}).get(sid))
         (take if ok else skip).append((sid, rec, kb, why) if ok else (sid, why))
     take.sort(key=lambda t: -(t[2] or 0))
     # **按 pane 去重。** 真正的资源是 pane，不是 sid：会话在同一个 pane 里重开过
@@ -1404,8 +1447,11 @@ def cmd_autocompact(args):
             continue
         rows.append((sid, rec, _ctx_kb(ctx_usage(rec.get("pane", "")))))
     hist = compact_history()
+    # 只给过了阈值的读 transcript 末尾（2MB），其余的用不上
+    post = {sid: compact_state_of(sid) for sid, _, kb in rows
+            if kb is not None and kb >= args.threshold}
     take, skip = pick_compact_targets(rows, args.threshold, at, hist,
-                                      args.cooldown, args.max, args.min_idle)
+                                      args.cooldown, args.max, args.min_idle, post)
 
     out = {"at": ts(at), "scanned": len(rows), "of_total": len(sess),
            "threshold_kb": args.threshold, "dry_run": bool(args.dry_run),
@@ -1432,9 +1478,14 @@ def cmd_autocompact(args):
         kb_before = kb
         # 复用已有那条路：三道护栏 + 等它真降下来 + 把被冲掉的任务原文重发。
         # **不在这里重写一份**，那会立刻变成第二份真相。
+        before = compact_state_of(sid)
         rc = cmd_compact(argparse.Namespace(
             target=sid, force=False, timeout=args.timeout, via="autocompact"))
         kb_after = _ctx_kb(ctx_usage(rec.get("pane", "")))
+        # 页脚可能还挂着旧数；transcript 里多了一个压缩点，就以它记的压后大小为准
+        st = compact_state_of(sid)
+        if st and st.get("post_kb") is not None and (not before or st["at"] != before["at"]):
+            kb_after = st["post_kb"]
         note_compacted(sid, kb_before, kb_after, now())
         row = {"who": disp_of(rec), "pane": rec.get("pane", ""), "rc": rc,
                "kb": "%s → %s" % (kb_before, kb_after)}
