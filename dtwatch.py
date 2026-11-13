@@ -1600,6 +1600,14 @@ def self_reacted(m: dict, cfg) -> str:
     return ""
 
 
+def merge_triage(current: dict, updates: dict) -> dict:
+    """把扫表情得到的新结论并进**现读的** triage。已有的条目一律不覆盖（人标的优先）。**纯函数。**"""
+    out = dict(current)
+    for k, v in updates.items():
+        out.setdefault(k, v)
+    return out
+
+
 def sweep_acks(cfg, per_conv_open: dict) -> list[dict]:
     """回扫「还开着的条目」，看他是不是已经贴表情结掉了。
 
@@ -1608,7 +1616,7 @@ def sweep_acks(cfg, per_conv_open: dict) -> list[dict]:
     """
     if not per_conv_open:
         return []
-    triage = load_json(TRIAGE, {})
+    updates = {}
     closed = []
     for cid, items in per_conv_open.items():
         earliest = min(i["time"] for i in items)
@@ -1630,12 +1638,14 @@ def sweep_acks(cfg, per_conv_open: dict) -> list[dict]:
             e = acked.get(i["id"])
             if not e:
                 continue
-            triage[i["id"]] = {"status": "done", "ts": ts(now()),
-                               "note": f"他自己贴了「{e}」表情，当已处理"}
+            updates[i["id"]] = {"status": "done", "ts": ts(now()),
+                                "note": f"他自己贴了「{e}」表情，当已处理"}
             closed.append({"id": i["id"], "conv": i["conv"],
                            "emoji": e, "text": i["text"][:60]})
     if closed:
-        save_json(TRIAGE, triage)
+        # 写回前现读：上面逐个群问钉钉要好几分钟，这期间别人（路由、会话）可能已经 mark 过。
+        # 拿开头读的旧快照整份写回会把那些标记冲掉 —— 11-13 14:46 标的两条就是这么丢的。
+        save_json(TRIAGE, merge_triage(load_json(TRIAGE, {}), updates))
         logline(f"[acks] 表情结掉 {len(closed)} 条: "
                 + "; ".join(f"{c['conv']}/{c['emoji']}" for c in closed))
     return closed
