@@ -416,6 +416,98 @@ def match_awaiting(claims, rec: dict, at) -> tuple[str, str]:
     return "", ""
 
 
+# ------------------------------------------------------------- 路由会话兜底
+#
+# 2026-11-12 起（用户同意）：同事消息里点名他（at_me）或催办（urgent / urgent:*）的，
+# 没被登记、静态表认领时，投给路由会话（config 的 cc.main_window 里那个会话），
+# 由它判断归谁。哨兵推手机照旧。
+#
+# 只投 `cc.router_since` 之后采进来的，且不超过 ROUTER_MAX_AGE_HOURS：
+# 上线那一刻 inbox 里已有上千条历史 at_me，不能一次灌给路由；at_me 又是「必达」，
+# 没 mark 会每 15 分钟重投，年龄上限顺带给重投封了顶。
+ROUTER_MAX_AGE_HOURS = 24
+
+
+def router_hit(rec: dict) -> str:
+    """这条该不该交给路由会话兜底。返回标签（「点名」/「催办」），不该返回空。**纯函数。**"""
+    flags = rec.get("flags") or []
+    if "at_me" in flags:
+        return "点名"
+    if any(f == "urgent" or str(f).startswith("urgent:") for f in flags):
+        return "催办"
+    # 真人私聊（2026-11-12 起）：私聊不带他名字就没有 at_me，以前整类漏掉 ——
+    # 当晚一条私聊回的正是路由在查的那件事，路由却没收到。
+    # 只认 level=high：机器人私聊是 normal，贴过表情的被压成 low（那类 match_router 也会按已处理跳过）。
+    if "dm" in flags and rec.get("level") == "high" and not is_ack_only(rec.get("text") or ""):
+        return "私聊"
+    return ""
+
+
+# 收尾话：私聊兜底上线当天一次涌进 15 条存量，全是对方在他回复之后说的「好的」「收到」「1」。
+ACK_ONLY = re.compile(r"^(好的?|好啊|好嘞|嗯+|哦+|ok|okay|收到|谢谢|感谢|多谢|thanks?|thx|对|是的?|行|可以|1|👌|🉑|👍|🙏|hello|hi)$", re.I)
+
+
+def is_ack_only(text: str) -> bool:
+    """整条只是一两句收尾 / 应答的话。**纯函数。**问句一律不算。"""
+    t = text.strip()
+    if not t or len(t) > 12 or "?" in t or "？" in t:
+        return False
+    parts = [x for x in re.split(r"[\s,，。.!！~～、]+", t) if x]
+    return bool(parts) and all(ACK_ONLY.match(x) for x in parts)
+
+
+def match_router(rec: dict, router, at) -> tuple[str, str]:
+    """路由会话兜底。`router` 形如 `{"sid":…, "since":"YYYY-MM-DD HH:MM:SS"}`，
+    给 None / 缺 sid / 缺 since 都是不兜底。**纯判据：不读盘、不看时钟。**
+
+    起点认 `collected_at`（采进来的时刻），没有才退回 `time`：采集器隔夜补采的旧消息
+    `time` 很早，但对路由来说是刚到的新事。
+    已经有人管了的（他贴过表情、私聊里之后回过话）不投 —— 判据跟哨兵提醒共用 `at_me_handled`。
+    """
+    if not router or not router.get("sid") or not router.get("since"):
+        return "", ""
+    tag = router_hit(rec)
+    if not tag:
+        return "", ""
+    if at_me_handled(rec, False):
+        return "", ""
+    got = rec.get("collected_at") or rec.get("time") or ""
+    if not got or got < router["since"]:
+        return "", ""
+    if got < ts(at - dt.timedelta(hours=ROUTER_MAX_AGE_HOURS)):
+        return "", ""
+    return router["sid"], "路由·" + tag
+
+
+def route_why(rec: dict, cfg, claims=None, at=None, router=None) -> tuple[str, str, str]:
+    """`route_of` 加上「凭什么」：返回 (sid, 标签, why)，why ∈ awaiting / static / router / ""。
+
+    顺序：在等回信的登记 → 静态表 → 路由会话兜底。**纯函数**，契约同 `route_of`。
+    """
+    if claims:
+        if at is None:
+            raise ValueError(
+                "route_of: 给了 claims 就必须给 at —— 过期判断不能靠它自己看时钟")
+        sid, label = match_awaiting(claims, rec, at)
+        if sid:
+            # 登记没写 label 时退回对方的名字，跟静态表「用命中的那个 key 当标签」一致。
+            return sid, label or (rec.get("sender") or rec.get("conv") or ""), "awaiting"
+    routes = cfg.get("route") or {}
+    for key in ((rec.get("conv") or ""), (rec.get("sender") or "")):
+        if key and key in routes:
+            r = routes[key]
+            if isinstance(r, str):
+                return r, key, "static"
+            return r.get("session", ""), r.get("label") or key, "static"
+    if router:
+        if at is None:
+            raise ValueError("route_why: 给了 router 就必须给 at")
+        sid, label = match_router(rec, router, at)
+        if sid:
+            return sid, label, "router"
+    return "", "", ""
+
+
 def route_of(rec: dict, cfg, claims=None, at=None) -> tuple[str, str]:
     """这条消息归哪个 Claude 会话。返回 (session_id, 标签)，没配就是 ("","")。
 
@@ -433,24 +525,8 @@ def route_of(rec: dict, cfg, claims=None, at=None) -> tuple[str, str]:
     它是纯函数，能测就因为这个。忘了给宁可**当场抛错**，也不要悄悄按
     「永不过期」走，那就是判据 2 说的永久劫持。
     """
-    if claims:
-        if at is None:
-            raise ValueError(
-                "route_of: 给了 claims 就必须给 at —— 过期判断不能靠它自己看时钟")
-        sid, label = match_awaiting(claims, rec, at)
-        if sid:
-            # 登记没写 label 时退回对方的名字，跟静态表「用命中的那个 key 当标签」
-            # 一致。⚠️ 欠账：这样一来显示层分不出「静态路由」和「等回信」，
-            # 而 route_of 返回的是二元组，加第三个值会动到现有 14 个用例。
-            return sid, label or (rec.get("sender") or rec.get("conv") or "")
-    routes = cfg.get("route") or {}
-    for key in ((rec.get("conv") or ""), (rec.get("sender") or "")):
-        if key and key in routes:
-            r = routes[key]
-            if isinstance(r, str):
-                return r, key
-            return r.get("session", ""), r.get("label") or key
-    return "", ""
+    sid, label, _ = route_why(rec, cfg, claims, at)
+    return sid, label
 
 
 # ---------------------------------------------------------- 「在等回信」的登记
@@ -1333,7 +1409,8 @@ def must_arrive(rec: dict) -> bool:
 LEVEL_ORDER = {"high": 0, "normal": 1, "low": 2}
 
 
-def select_for_session(records, cfg, session, level, triage, ledger, at, claims=None):
+def select_for_session(records, cfg, session, level, triage, ledger, at, claims=None,
+                       router=None):
     """挑出「归这个会话、此刻该投给它」的条目。**纯判据：不读文件、不看时钟。**
 
     抽出来的理由跟 tmux_probe 抽屏幕抓取一样，是这条判据错了会**静默漏事**：
@@ -1350,11 +1427,14 @@ def select_for_session(records, cfg, session, level, triage, ledger, at, claims=
     返回 `[(rec, label, prev_stamp)]`；`prev_stamp` 非空表示这是一次**重投**，
     调用方据此写日志。**不改 rec** —— 打 `route_label` 留给调用方，
     这样这个函数拿同一批记录跑两次结果一样。
+
+    `router`（2026-11-12 加）：路由会话兜底，形状见 `match_router`。默认 None =
+    跟加这一层之前逐字相同。
     """
     want = LEVEL_ORDER[level]
     out = []
     for r in records:
-        sid, label = route_of(r, cfg, claims, at)
+        sid, label, _ = route_why(r, cfg, claims, at, router)
         if sid != session:
             continue
         # 不把 low 塞给项目会话 —— 日报卡片、CI 推送、文件消息刷屏没意义
@@ -1398,6 +1478,76 @@ def stamp_delivered(ledger, records, at):
     return ledger
 
 
+def direct_rows(picked, cfg, claims, at, stamp_iso) -> list:
+    """这一批里「按等回信登记认领、直接投给会话」的，拼成 route.ndjson 的直达行。**纯函数。**
+
+    `picked` 是 `select_for_session` 的返回。只记首投（`prev` 为空）：
+    必达条目过窗口会重投，重投不是新的分发决定，不再记一行。
+    """
+    import route
+    rows = []
+    for r, label, prev in picked:
+        if prev:
+            continue
+        sid, _, why = route_why(r, cfg, claims, at)
+        if why != "awaiting":
+            continue
+        who = r.get("sender") or r.get("conv") or ""
+        rows.append(route.direct_rec(
+            "dingtalk", "%s：%s" % (who, r.get("text") or ""), sid, "awaiting",
+            r.get("id", ""), stamp_iso, to_label=label))
+    return rows
+
+
+def same_window(actual, wanted):
+    """`OS:✳ xiaoding` 和配置里的 `OS:xiaoding` 算同一个窗口。**纯函数。** 窗口名前常挂状态符号。"""
+    def bare(s):
+        s = (s or "").strip()
+        while s and not (s[0].isalnum() or s[0] in "_-"):
+            s = s[1:].lstrip()
+        return s
+    a_s, _, a_w = (actual or "").partition(":")
+    w_s, _, w_w = (wanted or "").partition(":")
+    return bool(w_w) and a_s == w_s and bare(a_w) == bare(w_w)
+
+
+def _pane_is_window(pane, main_window):
+    """IO：这个 pane 在不在路由窗口里。问不出来就当「可能是」，交给后面的完整认法。"""
+    try:
+        out = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#S:#W"],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:                                    # noqa: BLE001
+        return True
+    return same_window(out, main_window) if out else True
+
+
+def router_of(cfg, session, at):
+    """路由会话兜底的参数。IO 外壳：只有调用方就是路由会话时才去认。
+
+    认法跟 dtcc 一模一样：`dtcc.main_of(cfg, 会话表)`，按 `cc.main_window` 找窗口里的活会话。
+    `cc.router_since` 没配 = 不兜底（at_me 照旧只由哨兵推手机）。
+    """
+    since = ((cfg.get("cc") or {}).get("router_since") or "").strip()
+    if not since or not session:
+        return None
+    # 先用一次 tmux 便宜地排除：每个会话每轮收尾都会走到这里，整张会话表要 3 秒多，
+    # 11-12 实测 for-session 从 3.6 秒涨到 7.2 秒。自己所在窗口都不是路由窗口，就不用查表了。
+    pane = os.environ.get("TMUX_PANE", "")
+    if pane and not _pane_is_window(pane, (cfg.get("cc") or {}).get("main_window") or ""):
+        return None
+    try:
+        if BASE not in sys.path:
+            sys.path.insert(0, BASE)
+        import dtcc
+        main, _ = dtcc.main_of(cfg, dtcc.LiveRoutes().sessions())
+    except Exception as e:                               # noqa: BLE001
+        logline(f"[for-session] 认路由会话失败 {type(e).__name__}: {e}")
+        return None
+    if not main or main != session:
+        return None
+    return {"sid": main, "since": since}
+
+
 def cmd_for_session(cfg, args):
     """吐出「归本会话、该投给它」的条目，并记账防重复投递。
 
@@ -1410,10 +1560,12 @@ def cmd_for_session(cfg, args):
     triage = load_json(TRIAGE, {})
     ledger = load_json(INJECTED, {})
     at = now()
+    claims = live_claims(at)
+    picked = select_for_session(
+        read_inbox(), cfg, args.session, args.level, triage, ledger, at,
+        claims, router_of(cfg, args.session, at))
     out = []
-    for r, label, prev in select_for_session(
-            read_inbox(), cfg, args.session, args.level, triage, ledger, at,
-            live_claims(at)):
+    for r, label, prev in picked:
         if prev:
             logline(f"[for-session] 重投 {r['id'][:14]} "
                     f"（上次 {prev}，至今无 triage 记录）")
@@ -1422,6 +1574,12 @@ def cmd_for_session(cfg, args):
     if out and not args.peek:
         stamp_delivered(ledger, out, at)
         save_json(INJECTED, ledger)
+        # 按登记认领直接投出去的，也在路由记录里留一行（decision=direct）。记不下来不挡投递。
+        try:
+            import route
+            route.log_direct(direct_rows(picked, cfg, claims, at, route.now_iso()))
+        except Exception as e:                           # noqa: BLE001
+            logline(f"[for-session] 记直达行失败 {type(e).__name__}: {e}")
     for r in out:
         print(json.dumps(r, ensure_ascii=False))
     return 0

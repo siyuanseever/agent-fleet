@@ -68,6 +68,43 @@ def new_id(ts, existing):
     return rid
 
 
+# ---------------------------------------------------------------- 直达行
+#
+# 有两类消息不经路由会话判断，直接到了某个会话手里：
+#   - 手机指令引用了某条播报（quote）、或文字里点了会话标签（named）—— dtcc 直接派；
+#   - 同事的回信被「在等回信」的登记认领（awaiting）—— dtwatch for-session 直接投。
+# 路由会话看不到这些，所以也记一行 decision=direct，格式跟判断行同一份。
+# direct 不进 open_items：它不是转出，没人欠回信。
+
+DIRECT_REASONS = ("quote", "named", "awaiting")
+
+
+def direct_rec(source, item, to, reason, evidence, ts, to_pane="", to_label=""):
+    """拼一行直达记录。**纯函数**；id 由 log_direct 落盘时补。"""
+    if reason not in DIRECT_REASONS:
+        raise ValueError("direct 的 reason 只能是 %s：%r" % ("/".join(DIRECT_REASONS), reason))
+    return {"ts": ts, "router": "", "source": source,
+            "item": " ".join(str(item or "").split())[:80],
+            "decision": "direct", "to": to, "to_pane": to_pane or "", "to_label": to_label or "",
+            "reason": reason, "evidence": evidence or ""}
+
+
+def log_direct(rows, path=None):
+    """把直达行追加进 route.ndjson，逐行补 id。IO。"""
+    if not rows:
+        return []
+    path = pathlib.Path(path) if path else ROUTES
+    existing = {rid_of(r) for r in load(path)}
+    out = []
+    for r in rows:
+        r = dict(r)
+        r["id"] = new_id(r["ts"], existing)
+        existing.add(r["id"])
+        append(r, path)
+        out.append(r)
+    return out
+
+
 # ---------------------------------------------------------------- 纯判断（有测试）
 
 def open_items(routes, nodes):

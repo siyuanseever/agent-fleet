@@ -11,7 +11,12 @@
 ## 1. 一条指令走一圈
 
 ```
-手机自聊 ──dtcc──▶ 路由会话（config.json 的 cc.main_window）
+手机自聊 ──dtcc──┬─ 引用了某条播报 / 点了会话标签 ──▶ 那个会话（直达，记一行 direct）
+                 └─ 其余 ──▶ 路由会话（config.json 的 cc.main_window）
+同事消息 ──dtwatch 采进 inbox──┬─ 登记过在等这个人回信 ──▶ 登记的会话（直达，记一行 direct）
+                               ├─ 点名他 / 催办 / 真人私聊（收尾话除外），没人认领，cc.router_since 之后采进来、不超过 24 小时 ──▶ 路由会话
+                               └─ 其余 ──▶ 留在队列；点名 / 催办另由哨兵推手机（照旧）
+                     路由会话收到的，都按下面这圈走：
                      │
                      ├─ 看：statetrail-tmux search / list --json，再读对方的会话记录
                      ├─ 判：skip 已有人在做 / forward 转过去 / ask 交给人定 / manual 送不进
@@ -33,7 +38,8 @@
 
 | 环节 | 用什么 | 在哪 |
 |---|---|---|
-| 入口 | `dtcc.py`：没引用播报、没点名的手机指令送到 `cc.main_window` | 本仓库 |
+| 入口 · 手机 | `dtcc.py`：没引用播报、没点名的手机指令送到 `cc.main_window`；引用 / 点名的直达并记 direct | 本仓库 |
+| 入口 · 同事消息 | `dtwatch.py for-session`（Stop hook 调）：等回信登记 → 静态 `route` 表（现为空）→ 点名 / 催办 / 真人私聊兜底给路由会话（「好的」「收到」这类收尾话不投） | 本仓库 |
 | 看 | `statetrail-tmux list --json`（谁在、什么状态、最近几轮）、`search --json`（这事在哪说过） | statetrail（公开仓库） |
 | 判 | skill `route-to-session`：四步只读查证，再决定 | `~/.claude/skills/route-to-session/` |
 | 送 · 同账号 | Claude Code 自带 `SendMessage`，进对方信箱，不打断 | 内置 |
@@ -60,6 +66,10 @@
 ```json
 {"ts":"…","re":"r-261110-1813","decision":"done|blocked","by":"<回信的 sid>","text":"一句话"}
 ```
+
+**直达行**（2026-11-12 起，dtcc / dtwatch 自动写）：绕过路由直接到了某个会话的，`decision: direct`，
+`router` 为空，`source` 是 `phone` 或 `dingtalk`，`reason` 是 `quote` / `named` / `awaiting`，`evidence` 是消息 id。
+它不是转出，`route.py open` 不列。
 
 - 2026-11-10 之前的判断行没有 `id`，用 `ts` 当 id。
 - 「还没回信」= 有 `decision: forward` 的判断行，没有 `re` 指向它的回信行。

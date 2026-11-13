@@ -607,6 +607,46 @@ def main_of(cfg, sessions) -> tuple[str, str]:
     return (sid, "session") if sid else ("", "unset")
 
 
+def direct_reason(why: str, target: str, main_sid: str) -> str:
+    """这次派发是不是「绕过路由会话直达」。返回 quote / named，不是返回空。**纯函数。**
+
+    `why` 是 target_of 的依据（`quote`）或 entitled 包过一层的（`mine(quote)`）。
+    目标就是路由会话本身时不算绕过 —— 路由自己收到了，它会自己记。
+    """
+    base = why[5:-1] if why.startswith("mine(") and why.endswith(")") else why
+    if base not in ("quote", "named"):
+        return ""
+    if not target or target == main_sid:
+        return ""
+    return base
+
+
+def note_direct(cfg, cmd: dict, sid: str, why: str, source=None) -> None:
+    """引用 / 点名直达某会话时，往 data/route.ndjson 记一行 decision=direct。IO。
+
+    记不下来只写日志，绝不挡投递。
+    """
+    try:
+        if "quote" not in why and "named" not in why:   # default→main 这类不用去读会话表
+            return
+        sessions = _routes(source).sessions()
+        main, _ = main_of(cfg, sessions)
+        reason = direct_reason(why, sid, main)
+        if not reason:
+            return
+        rec = sessions.get(sid) or {}
+        proj = rec.get("project") or ""
+        label = f"{proj}/{sid_tag(sid)}" if proj else sid_tag(sid)
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import route
+        route.log_direct([route.direct_rec(
+            "phone", cmd.get("text") or "", sid, reason, cmd.get("id", ""),
+            route.now_iso(), rec.get("pane", ""), label)])
+    except Exception as e:                        # noqa: BLE001
+        logline(f"[route] 记直达行失败 {type(e).__name__}: {e}")
+
+
 def owner_of_quote(quoted_text: str, source=None) -> str:
     """他引用的那条播报是谁发的。认不出来返回空。"""
     return match_broadcast(_routes(source).broadcasts(), quoted_text)
@@ -1000,6 +1040,7 @@ def push_once(cfg, wake: bool = True) -> int:
             if ok:
                 consume([mid])
                 done += 1
+                note_direct(cfg, c, sid, why)
             else:
                 unclaim(mid)
                 held.append(c["time"])
@@ -1266,6 +1307,7 @@ def wait_for_command(cfg, timeout: int, accept_bare: bool,
                 logline(f"[route] lost-race sid={sid_tag(sid)} :: {c['text'][:60]}")
                 continue
             logline(f"[route] take({why}) sid={sid_tag(sid)} :: {c['text'][:60]}")
+            note_direct(cfg, c, sid, why)
             real.append(c)
         advance_cursor(newest, held)
         if real:
@@ -1552,11 +1594,14 @@ def cmd_hook_stop(cfg, args):
         # 他没发指令，但可能有按 route 表派给本会话的钉钉消息 —— 直接接着干
         work = routed_work(sid)
         if work:
-            lines = [f"- [{w['time']}] {w['conv']}｜{w['sender']}：{w['text'][:220]}"
+            lines = [f"- [{w['time']}] ({w.get('route_label') or '-'}) "
+                     f"{w['conv']}｜{w['sender']}：{w['text'][:220]}"
                      for w in work[:12]]
             reason = (
-                "钉钉来了归本项目的新消息（dtwatch 按 config.json 的 route 表派给这个会话，"
-                f"不是发给哨兵会话的）。按 {os.path.join(HERE, 'TRIAGE.md')} 处理，"
+                "钉钉来了派给这个会话的新消息（dtwatch 派的：你登记过在等这个人回信，"
+                "或者你是路由会话、这条点了他的名 / 在催办 —— 路由会话要先判断归谁，"
+                "该转就照 route-to-session 转出去并记 route.py add）。"
+                f"按 {os.path.join(HERE, 'TRIAGE.md')} 处理，"
                 f"处理完用 `python3 {os.path.join(HERE, 'dtwatch.py')} mark <id...> "
                 "--status done|ignored|snoozed --note \"...\"` 回写：\n"
                 + "\n".join(lines)
@@ -1603,7 +1648,7 @@ def beat_fleet(sid: str, payload: dict):
 
 
 def routed_work(sid: str) -> list[dict]:
-    """问 dtwatch：有没有按 route 表派给本会话的新钉钉消息。
+    """问 dtwatch：有没有派给本会话的新钉钉消息（等回信的登记、route 表、路由会话兜底）。
 
     这是「让对应项目的 Claude 直接收到对应的消息」那条路 ——
     只谈某一个项目的那位同事，他的消息就该落到那个项目的会话手里接着干，
