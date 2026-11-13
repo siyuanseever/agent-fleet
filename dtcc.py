@@ -1103,6 +1103,56 @@ def wake_session(cfg, sid: str, cmd: dict) -> tuple[bool, str]:
         return False, "error"
 
 
+ROUTER_NUDGE_EVERY_S = 60          # 多久看一次有没有同事消息在等路由
+ROUTER_NUDGE_REPEAT_S = 15 * 60    # 同一条叫过一次后，多久内不再为它叫
+
+
+def router_nudge(items, nudged, at_s, repeat_s=ROUTER_NUDGE_REPEAT_S):
+    """有同事消息在等路由时，叫路由的那一行字。**纯函数。** 返回 `(文字, 这次算叫过的 id)`。
+
+    为什么要叫：同事消息只在路由会话「一轮收尾」时由 Stop hook 塞进去。路由闲着就没有收尾，
+    消息会一直等到它下次被别的事叫醒（11-12 上线当天就发现）。叫醒它，这一轮收尾时 hook 就把全文塞进去。
+    `nudged` 是 {id: 上次叫的时刻}；全都 repeat_s 内叫过了就不叫，免得路由在忙别的时被反复敲。
+    """
+    fresh = [r for r in items or () if r.get("id") and at_s - nudged.get(r["id"], -1e18) >= repeat_s]
+    if not fresh:
+        return "", []
+    parts = []
+    for r in fresh[:3]:
+        who = r.get("sender") or "?"
+        where = "" if r.get("single") else "@" + (r.get("conv") or "")
+        parts.append("%s %s%s：%s" % ((r.get("time") or "")[11:16], who, where,
+                                     (r.get("text") or "").replace("\n", " ")[:80]))
+    more = "（另有 %d 条）" % (len(fresh) - 3) if len(fresh) > 3 else ""
+    text = "【钉钉同事消息待路由 %d 条】%s%s。这一轮收尾时会把全文注入，按路由规则判、判完 dtwatch.py mark。" % (
+        len(fresh), "；".join(parts), more)
+    return text, [r["id"] for r in fresh]
+
+
+def nudge_router(cfg, nudged):
+    """IO 外壳：路由会话有待路由的同事消息就叫它一下。走 fleet.py wake，护栏照旧（在跑、停在权限框、输入框有半句话都不敲）。"""
+    main, _ = main_of(cfg, LiveRoutes().sessions())
+    if not main:
+        return
+    try:
+        p = subprocess.run([sys.executable, os.path.join(HERE, "dtwatch.py"), "for-session", main, "--peek"],
+                           capture_output=True, text=True, timeout=90,
+                           env=dict(os.environ, TMUX_PANE=""))   # 别让 dtwatch 拿 push-loop 自己的窗格去比
+        items = [json.loads(x) for x in (p.stdout or "").splitlines() if x.strip().startswith("{")]
+    except Exception as e:                                       # noqa: BLE001
+        logline(f"[push] 查路由待办失败 {type(e).__name__}: {e}")
+        return
+    text, ids = router_nudge(items, nudged, time.time())
+    if not text:
+        return
+    w = subprocess.run([sys.executable, os.path.join(HERE, "fleet.py"), "wake", main[:8], "--task", text],
+                       capture_output=True, text=True, timeout=60)
+    if w.returncode == 0:
+        for i in ids:
+            nudged[i] = time.time()
+        logline(f"[push] 叫路由处理同事消息 {len(ids)} 条")
+
+
 def cmd_push_loop(cfg, args):
     """盯自聊天的常驻循环：采到就贴表情回执 + 叫醒该接的会话。
 
@@ -1125,7 +1175,8 @@ def cmd_push_loop(cfg, args):
     interval = max(5, int(args.interval))
     save_json(PUSHPID, os.getpid())
     logline(f"[push] loop start pid={os.getpid()} interval={interval}s（常轮询）")
-    last = 0.0
+    last = last_nudge = 0.0
+    nudged = {}
     while True:
         wall = time.time()
         if wall - last >= interval:
@@ -1134,6 +1185,12 @@ def cmd_push_loop(cfg, args):
                 push_once(cfg, wake=not args.no_wake)
             except Exception as e:                  # noqa: BLE001
                 logline(f"[push] once 异常（继续跑）{type(e).__name__}: {e}")
+        if not args.no_wake and wall - last_nudge >= ROUTER_NUDGE_EVERY_S:
+            last_nudge = wall
+            try:
+                nudge_router(cfg, nudged)
+            except Exception as e:                  # noqa: BLE001
+                logline(f"[push] 叫路由异常（继续跑）{type(e).__name__}: {e}")
         time.sleep(min(2, interval))
         if args.once:
             return 0
